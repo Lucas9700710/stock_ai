@@ -9,7 +9,7 @@ import yfinance as yf
 import random
 import os
 from collections import deque
-
+from datetime import date,timedelta
 # --- 0. 系統設定 ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "stock_dqn_model.pth"
@@ -154,7 +154,7 @@ def run_simulation():
             next_state, reward, done, _, _ = env.step(action)
             agent.memory.append((state, action, reward, next_state, done))
             state = next_state
-            if t % 10 == 0: agent.train(64)
+            if t % 10 == 0: agent.train(64) # 每 n 步訓練一次
             if done: break
         agent.update_target()
         print(f"Episode {e+1}/{EPISODES} | Net Worth: {env.net_worth:.2f} | Eps: {agent.epsilon:.2f}")
@@ -164,7 +164,7 @@ def run_simulation():
     print(f"模型已成功儲存於 {MODEL_PATH}")
 
     # 測試與績效分析
-    data = get_cleaned_data(ticker, "2022-01-01", "2024-01-01")
+    data = get_cleaned_data(ticker, "2022-01-01",date.today().strftime('%Y-%m-%d'))
     state, _ = env.reset()
     history = []
     for _ in range(len(data)-32):
@@ -191,6 +191,9 @@ def run_simulation():
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.show()
+    plt.savefig("final_performance.png")
+    print("績效圖已儲存為 final_performance.png")
+    plt.close()
 
 if __name__ == "__main__":
     run_simulation()
