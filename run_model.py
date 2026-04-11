@@ -30,7 +30,7 @@ def get_cleaned_data(ticker, start, end=None):
     return df.dropna()[['Open', 'High', 'Low', 'Close', 'MA5', 'MA20', 'RSI', 'Log_Ret']]
 
 # --- 2. 每日自動執行函式 ---
-def run_daily_simulation(model, ticker="2330.TW", simulate_date=None):
+def run_daily_simulation(model, ticker="SNPS", simulate_date=None):
     history_file = "trade_history.npy"
     status_file = "account_status.npy"
     
