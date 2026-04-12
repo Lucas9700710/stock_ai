@@ -30,7 +30,7 @@ def get_cleaned_data(ticker, start, end=None):
     return df.dropna()[['Open', 'High', 'Low', 'Close', 'MA5', 'MA20', 'RSI', 'Log_Ret']]
 
 # --- 2. 每日自動執行函式 ---
-def run_daily_simulation(model, ticker="SNPS", simulate_date=None):
+def run_daily_simulation(model, ticker="AAPL", simulate_date=None):
     history_file = "trade_history.npy"
     status_file = "account_status.npy"
     
@@ -113,7 +113,7 @@ if __name__ == "__main__":
         for f in ["trade_history.npy", "account_status.npy"]:
             if os.path.exists(f): os.remove(f)
             
-        for n in range(1000, -1, -1):
+        for n in range(1500, -1, -1):
             target_dt = (date.today() - timedelta(days=n)).strftime('%Y-%m-%d')
             # 排除週末 (yfinance 沒數據會報錯)
             if datetime.strptime(target_dt, '%Y-%m-%d').weekday() < 5:
