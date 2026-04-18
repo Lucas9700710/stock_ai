@@ -16,6 +16,7 @@ MODEL_PATH = "stock_dqn_model.pth"
 
 # --- 1. 資料處理：加入更多特徵 ---
 def get_cleaned_data(ticker, start, end):
+    """從 yfinance 下載數據並加入技術指標"""
     df = yf.download(ticker, start=start, end=end, progress=False)
     # 技術指標：讓模型更有方向感
     df['MA5'] = df['Close'].rolling(window=5).mean()
@@ -42,6 +43,7 @@ class StockTradingEnv(gym.Env):
         self.reset()
 
     def reset(self, seed=None):
+        '''重設還境，初始資金 10 萬，無持股'''
         super().reset(seed=seed)
         self.balance = 100000.0
         self.shares = 0
@@ -50,7 +52,7 @@ class StockTradingEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
-        # 抓取過去 30 天數據
+        '''抓取過去 30 天數據'''
         window = self.data.iloc[self.current_step - self.lookback_window : self.current_step].values
         # Z-Score 正規化：讓模型在不同股價水準下都能學習
         mean = window.mean(axis=0)
@@ -59,6 +61,7 @@ class StockTradingEnv(gym.Env):
         return norm_window.flatten().astype(np.float32)
 
     def step(self, action):
+        "''執行動作，計算獎勵，更新狀態'''"
         price = self.data.iloc[self.current_step]['Close'].item()
         prev_net_worth = self.net_worth
 
@@ -95,6 +98,7 @@ class QNet(nn.Module):
 
 class DQNAgent:
     def __init__(self, state_dim, action_dim):
+        "''DQN Agent 初始化'''"
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.memory = deque(maxlen=10000)
@@ -109,9 +113,11 @@ class DQNAgent:
         self.update_target()
 
     def update_target(self):
+        "''將主模型權重複製到目標模型'''"
         self.target_model.load_state_dict(self.model.state_dict())
 
     def act(self, state, train=True):
+        "''根據 epsilon-greedy 策略選擇動作'''"
         if train and random.random() < self.epsilon:
             return random.randrange(self.action_dim)
         with torch.no_grad():
@@ -119,6 +125,7 @@ class DQNAgent:
             return self.model(s).argmax().item()
 
     def train(self, batch_size):
+        "''從記憶庫中抽取批次進行訓練'''"
         if len(self.memory) < batch_size: return
         batch = random.sample(self.memory, batch_size)
         s, a, r, ns, d = zip(*batch)
@@ -140,7 +147,7 @@ class DQNAgent:
 # --- 4. 執行與分析報告 ---
 def run_simulation():
     ticker = "SNPS"
-    data = get_cleaned_data(ticker, "2022-01-01", "2026-01-01")
+    data = get_cleaned_data(ticker, "2020-01-01", "2022-01-01")
     env = StockTradingEnv(data)
     agent = DQNAgent(env.state_dim, 3)
 
@@ -164,12 +171,13 @@ def run_simulation():
     print(f"模型已成功儲存於 {MODEL_PATH}")
 
     # 測試與績效分析
-    data = get_cleaned_data(ticker, "2022-01-01",date.today().strftime('%Y-%m-%d'))
+    data = get_cleaned_data(ticker, "2024-01-01",date.today().strftime('%Y-%m-%d'))
     state, _ = env.reset()
     history = []
-    for _ in range(len(data)-32):
+    for n in range(len(data)-32):
         action = agent.act(state, train=False)
         state, _, done, _, _ = env.step(action)
+        print(f"Step: {n+1} | Action: {['Hold', 'Buy', 'Sell'][action]} | Net Worth: {env.net_worth:.2f}") # 每一步都印出動作與淨資產
         history.append(env.net_worth)
         if done: break
 
