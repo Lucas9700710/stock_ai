@@ -1,15 +1,91 @@
-import os
+import gymnasium as gym
 import torch
-import numpy as np
-import yfinance as yf
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from datetime import date,timedelta
 import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+import random
+import os
+from collections import deque
+from datetime import date,timedelta
+# --- 0. 系統設定 ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_PATH = "stock_dqn_model.pth"
 
+# --- 1. 資料處理：加入更多特徵 ---
+def get_cleaned_data(ticker, start, end):
+    """從 yfinance 下載數據並加入技術指標"""
+    df = yf.download(ticker, start=start, end=end, progress=False)
+    # 技術指標：讓模型更有方向感
+    df['MA5'] = df['Close'].rolling(window=5).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+    df['RSI'] = 100 - (100 / (1 + df['Close'].pct_change().rolling(14).apply(lambda x: x[x>0].sum()/abs(x[x<0].sum()) if x[x<0].sum()!=0 else 10)))
+    df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
+    
+    df = df.dropna()
+    # 特徵欄位：開高低收、均線、RSI、報酬率 (共 8 維)
+    return df[['Open', 'High', 'Low', 'Close', 'MA5', 'MA20', 'RSI', 'Log_Ret']]
 
-# --- 1. 模型與環境設定 ---
+# --- 2. 交易環境：考慮手續費與 30 天視窗 ---
+class StockTradingEnv(gym.Env):
+    def __init__(self, data, lookback_window=30):
+        super(StockTradingEnv, self).__init__()
+        self.data = data
+        self.lookback_window = lookback_window
+        self.action_space = gym.spaces.Discrete(3) # 0:觀望, 1:買, 2:賣
+        self.state_dim = lookback_window * 8
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
+        
+        self.fee = 0.001425 # 台股手續費
+        self.tax = 0.003    # 證交稅
+        self.reset()
+
+    def reset(self, seed=None):
+        '''重設還境，初始資金 10 萬，無持股'''
+        super().reset(seed=seed)
+        self.balance = 100000.0
+        self.shares = 0
+        self.net_worth = 100000.0
+        self.current_step = self.lookback_window
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        '''抓取過去 30 天數據'''
+        window = self.data.iloc[self.current_step - self.lookback_window : self.current_step].values
+        # Z-Score 正規化：讓模型在不同股價水準下都能學習
+        mean = window.mean(axis=0)
+        std = window.std(axis=0) + 1e-8
+        norm_window = (window - mean) / std
+        return norm_window.flatten().astype(np.float32)
+
+    def step(self, action):
+        "''執行動作，計算獎勵，更新狀態'''"
+        price = self.data.iloc[self.current_step]['Close'].item()
+        prev_net_worth = self.net_worth
+
+        # 動作邏輯
+        if action == 1 and self.balance > price: # Buy
+            can_buy = int(self.balance / (price * (1 + self.fee)))
+            if can_buy > 0:
+                self.balance -= can_buy * price * (1 + self.fee)
+                self.shares += can_buy
+        elif action == 2 and self.shares > 0: # Sell
+            self.balance += self.shares * price * (1 - self.fee - self.tax)
+            self.shares = 0
+
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 1
+        
+        # 更新淨資產 (使用第 31 天的收盤價計算損益)
+        self.net_worth = self.balance + (self.shares * price)
+        reward = (self.net_worth - prev_net_worth) / prev_net_worth # 獲利百分比作為獎勵
+        
+        obs = self._get_obs() if not done else np.zeros(self.state_dim)
+        return obs, reward, done, False, {}
+
+# --- 3. 模型與 Agent ---
 class QNet(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -20,106 +96,87 @@ class QNet(nn.Module):
         )
     def forward(self, x): return self.fc(x)
 
-def get_cleaned_data(ticker, start, end=None):
-    df = yf.download(ticker, start=start, end=end, progress=False)
-    df['MA5'] = df['Close'].rolling(window=5).mean()
-    df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['RSI'] = 100 - (100 / (1 + df['Close'].pct_change().rolling(14).apply(
-        lambda x: x[x>0].sum()/abs(x[x<0].sum()) if x[x<0].sum()!=0 else 10)))
-    df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
-    return df.dropna()[['Open', 'High', 'Low', 'Close', 'MA5', 'MA20', 'RSI', 'Log_Ret']]
+class DQNAgent:
+    def __init__(self, state_dim, action_dim):
+        """DQN Agent 初始化"""
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.memory = deque(maxlen=10000)
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.02
+        self.epsilon_decay = 0.997
+        
+        
+        # 1. 先建立模型實體
+        self.model = QNet(state_dim, action_dim).to(device)
+        self.target_model = QNet(state_dim, action_dim).to(device)
+        
+        # 2. 檢查檔案是否存在，存在才載入權重
+        if os.path.exists(MODEL_PATH):
+            try:
+                state_dict = torch.load(MODEL_PATH, map_location=device)
+                self.model.load_state_dict(state_dict)
+                print(f"成功從 {MODEL_PATH} 載入預訓練權重！")
+            except Exception as e:
+                print(f"載入權重時發生錯誤（可能是模型結構不符）: {e}")
+        else:
+            print("找不到模型檔案，將使用隨機初始化的模型進行測試。")
+        # ------------------
 
-# --- 2. 每日自動執行函式 ---
-def run_daily_simulation(model, ticker="AAPL", simulate_date=None):
-    history_file = "trade_history.npy"
-    status_file = "account_status.npy"
-    
-    # 決定抓取數據的結束日：yfinance 的 end 是 exclusive (不包含該日)
-    # 若要獲取 A 日的收盤價，end 必須設為 A+1 日
-    fetch_end = None
-    if simulate_date:
-        fetch_end = (datetime.strptime(simulate_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-    
-    data = get_cleaned_data(ticker, "2022-01-01", end=fetch_end)
-    if len(data) < 31: return
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
+        self.update_target()
 
-    # 載入帳戶狀態
-    if os.path.exists(status_file):
-        status = np.load(status_file, allow_pickle=True).item()
-        balance, shares = status['balance'], status['shares']
-        history = list(np.load(history_file))
-    else:
-        balance, shares, history = 100000.0, 0, []
+    def update_target(self):
+        "''將主模型權重複製到目標模型'''"
+        self.target_model.load_state_dict(self.model.state_dict())
 
-    # 獲取狀態 (最後 30 天，不含最後一筆即今日收盤)
-    window = data.iloc[-31:-1].values 
-    mean, std = window.mean(axis=0), window.std(axis=0) + 1e-8
-    state = ((window - mean) / std).flatten().astype(np.float32)
+    def act(self, state, train=True):
+        "''根據 epsilon-greedy 策略選擇動作'''"
+        if train and random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
+        with torch.no_grad():
+            s = torch.FloatTensor(state).unsqueeze(0).to(device)
+            return self.model(s).argmax().item()
 
-    # 預測
-    with torch.no_grad():
-        s = torch.FloatTensor(state).unsqueeze(0)
-        action = model(s).argmax().item()
 
-    # 今日結算 (使用最後一筆數據 data.iloc[-1])
-    current_data = data.iloc[-1]
-    price = current_data['Close'].item()
-    fee, tax = 0.001425, 0.003
+# --- 4. 執行與分析報告 ---
+def run_simulation():
+    # 測試與績效分析
+    ticker = "SNPS"
+    data = get_cleaned_data(ticker, "2024-01-01",date.today().strftime('%Y-%m-%d'))
+    env = StockTradingEnv(data)
+    agent = DQNAgent(env.state_dim, 3)
+    state, _ = env.reset()
+    history = []
+    for n in range(len(data)-32):
+        action = agent.act(state, train=False)
+        state, _, done, _, _ = env.step(action)
+        print(f"Step: {n+1} | Action: {['Hold', 'Buy', 'Sell'][action]} | Net Worth: {env.net_worth:.2f}") # 每一步都印出動作與淨資產
+        history.append(env.net_worth)
+        if done: break
 
-    if action == 1 and balance > price: # Buy
-        can_buy = int(balance / (price * (1 + fee)))
-        if can_buy > 0:
-            balance -= can_buy * price * (1 + fee); shares += can_buy
-    elif action == 2 and shares > 0: # Sell
-        balance += shares * price * (1 - fee - tax); shares = 0
+    # 計算績效指標
+    history = np.array(history)
+    returns = np.diff(history) / history[:-1]
+    sharpe = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+    max_dd = (history / np.maximum.accumulate(history) - 1).min() * 100
 
-    net_worth = balance + (shares * price)
-    history.append(net_worth)
+    print(f"\n--- 最終績效報告 ---")
+    print(f"最終資產: {history[-1]:.2f}")
+    print(f"夏普比率: {sharpe:.2f}")
+    print(f"最大回撤: {max_dd:.2f}%")
 
-    # 儲存
-    np.save(status_file, {'balance': balance, 'shares': shares})
-    np.save(history_file, np.array(history))
-    
-    # 繪圖 
-    hist_np = np.array(history)
-    if len(hist_np) > 1:
-        returns = np.diff(hist_np) / (hist_np[:-1] + 1e-8)
-        sharpe = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
-        max_dd = (hist_np / np.maximum.accumulate(hist_np) - 1).min() * 100
-
-        print(f"[{date.today()}] 淨資產: {net_worth:.2f} | 夏普: {sharpe:.2f} | 回撤: {max_dd:.2f}%")
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(hist_np, label='AI Strategy', color='royalblue')
-        plt.title(f"AI Performance: {ticker} (Updated: {date.today()})")
-        plt.savefig("performance_report.png") # 儲存圖片
-        plt.close() # 關閉畫布避免記憶體洩漏
-    return net_worth
+    plt.figure(figsize=(12, 6))
+    plt.plot(history, label='AI Strategy', color='royalblue')
+    plt.title(f"AI Trading Performance: {ticker}")
+    plt.ylabel("Net Worth (TWD)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.savefig("final_performance.png")
+    #plt.show()
+    print("績效圖已儲存為 final_performance.png")
+    plt.close()
 
 if __name__ == "__main__":
-    from datetime import datetime
-    
-    # 預先載入模型
-    state_dim = 30 * 8
-    global_model = QNet(state_dim, 3)
-    global_model.load_state_dict(torch.load("stock_dqn_model.pth", map_location="cpu"))
-    global_model.eval()
-
-    # 模式選擇：True 為跑過去 100 天測試，False 為每日伺服器更新
-    TEST_MODE = True
-
-    if TEST_MODE:
-        # 清除舊紀錄以重新開始測試
-        for f in ["trade_history.npy", "account_status.npy"]:
-            if os.path.exists(f): os.remove(f)
-            
-        for n in range(1500, -1, -1):
-            target_dt = (date.today() - timedelta(days=n)).strftime('%Y-%m-%d')
-            # 排除週末 (yfinance 沒數據會報錯)
-            if datetime.strptime(target_dt, '%Y-%m-%d').weekday() < 5:
-                print(f"正在模擬: {target_dt}")
-                run_daily_simulation(global_model, simulate_date=target_dt)
-    else:
-        # 正式伺服器每日執行
-        run_daily_simulation(global_model)
-
+    run_simulation()

@@ -98,7 +98,7 @@ class QNet(nn.Module):
 
 class DQNAgent:
     def __init__(self, state_dim, action_dim):
-        "''DQN Agent 初始化'''"
+        """DQN Agent 初始化"""
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.memory = deque(maxlen=10000)
@@ -107,8 +107,23 @@ class DQNAgent:
         self.epsilon_min = 0.02
         self.epsilon_decay = 0.997
         
+        
+        # 1. 先建立模型實體
         self.model = QNet(state_dim, action_dim).to(device)
         self.target_model = QNet(state_dim, action_dim).to(device)
+        
+        # 2. 檢查檔案是否存在，存在才載入權重
+        if os.path.exists(MODEL_PATH):
+            try:
+                state_dict = torch.load(MODEL_PATH, map_location=device)
+                self.model.load_state_dict(state_dict)
+                print(f"成功從 {MODEL_PATH} 載入預訓練權重！")
+            except Exception as e:
+                print(f"載入權重時發生錯誤（可能是模型結構不符）: {e}")
+        else:
+            print("找不到模型檔案，將從隨機權重開始訓練。")
+        # ------------------
+
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
         self.update_target()
 
@@ -152,7 +167,7 @@ def run_simulation():
     agent = DQNAgent(env.state_dim, 3)
 
     # 訓練階段
-    EPISODES = 60
+    EPISODES = 50
     print(f"開始優化 {ticker} 的交易策略...")
     for e in range(EPISODES):
         state, _ = env.reset()
@@ -172,6 +187,7 @@ def run_simulation():
 
     # 測試與績效分析
     data = get_cleaned_data(ticker, "2024-01-01",date.today().strftime('%Y-%m-%d'))
+    env = StockTradingEnv(data)
     state, _ = env.reset()
     history = []
     for n in range(len(data)-32):
@@ -198,8 +214,8 @@ def run_simulation():
     plt.ylabel("Net Worth (TWD)")
     plt.grid(True, alpha=0.3)
     plt.legend()
-    plt.show()
     plt.savefig("final_performance.png")
+    #plt.show()
     print("績效圖已儲存為 final_performance.png")
     plt.close()
 
