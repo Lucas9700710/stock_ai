@@ -126,7 +126,7 @@ class DQNAgent:
 
     def train(self, batch_size):
         "''從記憶庫中抽取批次進行訓練'''"
-        if len(self.memory) < batch_size: return
+        if len(self.memory) < batch_size: return 
         batch = random.sample(self.memory, batch_size)
         s, a, r, ns, d = zip(*batch)
         
