@@ -46,17 +46,21 @@ def get_cleaned_data(ticker, start, end):
 
 # --- 2. 交易環境 ---
 class StockTradingEnv(gym.Env):
-    def __init__(self, data, lookback_window=60):
+    def __init__(self, data, lookback_window=30):
         super(StockTradingEnv, self).__init__()
         self.data = data
         self.lookback_window = lookback_window
         self.action_space = gym.spaces.Discrete(3) # 0:觀望, 1:買, 2:賣
         self.n_features = data.shape[1]
-        self.state_dim = lookback_window * self.n_features
+        
+        # 原本是 lookback_window * self.n_features
+        # 現在加上 3 個環境絕對狀態：現價、現金餘額、持倉數量
+        self.state_dim = lookback_window * self.n_features + 3 
+        
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
         
-        self.fee = 0.0001 # 模擬美股佣金
-        self.tax = 0.0    # 美股無證交稅
+        self.fee = 0.0001 
+        self.tax = 0.0    
         self.reset()
 
     def reset(self, seed=None):
@@ -69,11 +73,26 @@ class StockTradingEnv(gym.Env):
 
     def _get_obs(self):
         window = self.data.iloc[self.current_step - self.lookback_window : self.current_step].values
+        
+        # 時間序列標準化 (保留相對波動特徵)
         mean = window.mean(axis=0)
         std = window.std(axis=0) + 1e-8
         norm_window = (window - mean) / std
-        return norm_window.flatten().astype(np.float32)
-
+        flattened_obs = norm_window.flatten().astype(np.float32)
+        
+        # 提取現價 (window的最後一筆資料中，'Close' 位於 index 3)
+        current_price = window[-1, 3]
+        
+        # 將絕對數值適度縮放，避免單一特徵數值過大 (例如 100000 的現金) 導致梯度爆炸
+        # 這裡的除數可以根據你的標的物價格與初始資金微調
+        extra_state = np.array([
+            current_price / 1000.0,       # 縮放現價
+            self.balance / 100000.0,      # 縮放可用現金 (相對於初始資金)
+            self.shares / 100.0           # 縮放持倉量
+        ], dtype=np.float32)
+        
+        # 將標準化後的歷史數據與絕對狀態合併
+        return np.concatenate((flattened_obs, extra_state))
     def step(self, action):
         price = self.data.iloc[self.current_step]['Close'].item()
         prev_net_worth = self.net_worth
@@ -103,17 +122,55 @@ class StockTradingEnv(gym.Env):
 
 # --- 3. 模型與 Double DQN Agent ---
 class QNet(nn.Module):
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, seq_len=30, n_features=10, extra_dim=3, out_dim=3):
         super().__init__()
+        self.seq_len = seq_len
+        self.n_features = n_features
+        self.extra_dim = extra_dim
+        
+        # LSTM 層：負責處理時間序列 (batch_first=True 代表輸入格式為 Batch 在前)
+        self.lstm = nn.LSTM(
+            input_size=n_features, 
+            hidden_size=64,       # LSTM 輸出的特徵維度 
+            num_layers=1,         # 1 層通常足夠，避免嚴重過擬合
+            batch_first=True
+        )
+        
+        # 決策層：結合 LSTM 的輸出與 3 維的絕對帳戶狀態
         self.fc = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(64 + extra_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),      # 加入 Dropout 提高泛化能力
             nn.Linear(128, out_dim)
         )
-    def forward(self, x): return self.fc(x)
+
+    def forward(self, x):
+        # x 的形狀會是 (batch_size, seq_len * n_features + extra_dim)
+        
+        # 1. 將輸入資料切分為「時間序列」與「帳戶絕對狀態」
+        ts_len = self.seq_len * self.n_features
+        ts_x = x[:, :ts_len]        # 取前 300 個數值 (30天 * 10特徵)
+        extra_x = x[:, ts_len:]     # 取最後 3 個數值 (現價、現金、持倉)
+        
+        # 2. 將時間序列 Reshape 成 LSTM 需要的 3D 格式
+        # 形狀變為: (batch_size, seq_len, n_features)
+        ts_x = ts_x.view(-1, self.seq_len, self.n_features)
+        
+        # 3. 放入 LSTM 運算
+        lstm_out, (hn, cn) = self.lstm(ts_x)
+        
+        # 我們只需要 LSTM 在「最後一個時間步 (last time step)」的輸出結果
+        last_out = lstm_out[:, -1, :] 
+        
+        # 4. 將 LSTM 萃取出的特徵與帳戶狀態拼接
+        combined = torch.cat((last_out, extra_x), dim=1)
+        
+        # 5. 通過全連接層輸出 3 個動作的 Q 值
+        return self.fc(combined)
 
 class DQNAgent:
-    def __init__(self, state_dim, action_dim):
+    # 新增 seq_len 與 n_features 參數
+    def __init__(self, state_dim, action_dim, seq_len=30, n_features=10):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.memory = deque(maxlen=20000)
@@ -121,10 +178,11 @@ class DQNAgent:
         self.epsilon = 1.0
         self.epsilon_min = 0.1
         self.epsilon_decay = 0.9992
-        self.lr = 0.0001 # 較低的學習率
+        self.lr = 0.0001 
 
-        self.model = QNet(state_dim, action_dim).to(device)
-        self.target_model = QNet(state_dim, action_dim).to(device)
+        # 這裡改用新的參數初始化 QNet
+        self.model = QNet(seq_len=seq_len, n_features=n_features, extra_dim=3, out_dim=action_dim).to(device)
+        self.target_model = QNet(seq_len=seq_len, n_features=n_features, extra_dim=3, out_dim=action_dim).to(device)
         
         if os.path.exists(MODEL_PATH):
             try:
@@ -179,7 +237,7 @@ def run_simulation():
     # 訓練階段
     train_data = get_cleaned_data(ticker, "2020-01-01", "2023-12-31")
     env = StockTradingEnv(train_data)
-    agent = DQNAgent(env.state_dim, 3)
+    agent = DQNAgent(env.state_dim, 3, seq_len=env.lookback_window, n_features=env.n_features)
 
     EPISODES = 100
     print(f"開始訓練 {ticker} 策略 (Double DQN)...")
