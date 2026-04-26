@@ -18,44 +18,28 @@ MODEL_PATH = "stock_dqn_model.pth"
 def get_cleaned_data(ticker, start, end):
     """從 yfinance 下載數據並加入技術指標"""
     df = yf.download(ticker, start=start, end=end, progress=False)
-    
-    # 處理 yfinance 可能產生的 Multi-Index 欄位
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    # 技術指標
+    # 技術指標：讓模型更有方向感
     df['MA5'] = df['Close'].rolling(window=5).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    
-    # RSI
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-10)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
+    df['RSI'] = 100 - (100 / (1 + df['Close'].pct_change().rolling(14).apply(lambda x: x[x>0].sum()/abs(x[x<0].sum()) if x[x<0].sum()!=0 else 10)))
     df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
-    df['Vol_Change'] = df['Volume'].pct_change()
-    df['BIAS'] = (df['Close'] - df['MA20']) / df['MA20']
     
     df = df.dropna()
-    # 特徵欄位共 10 維
-    features = ['Open', 'High', 'Low', 'Close', 'MA5', 'MA20', 'RSI', 'Log_Ret', 'Vol_Change', 'BIAS']
-    return df[features]
+    # 特徵欄位：開高低收、均線、RSI、報酬率 (共 8 維)
+    return df[['Open', 'High', 'Low', 'Close', 'MA5', 'MA20', 'RSI', 'Log_Ret']]
 
 # --- 2. 交易環境：考慮手續費與 30 天視窗 ---
 class StockTradingEnv(gym.Env):
-    def __init__(self, data, lookback_window=60):
+    def __init__(self, data, lookback_window=30):
         super(StockTradingEnv, self).__init__()
         self.data = data
         self.lookback_window = lookback_window
         self.action_space = gym.spaces.Discrete(3) # 0:觀望, 1:買, 2:賣
-        self.n_features = data.shape[1]
-        self.state_dim = lookback_window * self.n_features
+        self.state_dim = lookback_window * 8
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
         
-        self.fee = 0.0001 # 模擬美股佣金
-        self.tax = 0.0    # 美股無證交稅
+        self.fee = 0.001425 # 台股手續費
+        self.tax = 0.003    # 證交稅
         self.reset()
 
     def reset(self, seed=None):
@@ -77,6 +61,7 @@ class StockTradingEnv(gym.Env):
         return norm_window.flatten().astype(np.float32)
 
     def step(self, action):
+        "''執行動作，計算獎勵，更新狀態'''"
         price = self.data.iloc[self.current_step]['Close'].item()
         prev_net_worth = self.net_worth
 
@@ -87,18 +72,15 @@ class StockTradingEnv(gym.Env):
                 self.balance -= can_buy * price * (1 + self.fee)
                 self.shares += can_buy
         elif action == 2 and self.shares > 0: # Sell
-            self.balance += self.shares * price * (1 - self.fee)
+            self.balance += self.shares * price * (1 - self.fee - self.tax)
             self.shares = 0
 
         self.current_step += 1
         done = self.current_step >= len(self.data) - 1
         
+        # 更新淨資產 (使用第 31 天的收盤價計算損益)
         self.net_worth = self.balance + (self.shares * price)
-        
-        # 獎勵設計：包含手續費懲罰
-        reward = (self.net_worth - prev_net_worth) / prev_net_worth
-        if action != 0:
-            reward += 0.0002
+        reward = (self.net_worth - prev_net_worth) / prev_net_worth # 獲利百分比作為獎勵
         
         obs = self._get_obs() if not done else np.zeros(self.state_dim)
         return obs, reward, done, False, {}
@@ -108,34 +90,45 @@ class QNet(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(in_dim, 256), 
+            nn.ReLU(),
+            nn.Dropout(p=0.2), # 訓練時隨機關閉 20% 的神經元，防止過度擬合
+            nn.Linear(256, 128), 
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
             nn.Linear(128, out_dim)
         )
     def forward(self, x): return self.fc(x)
 
 class DQNAgent:
     def __init__(self, state_dim, action_dim):
+        """DQN Agent 初始化"""
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.memory = deque(maxlen=20000)
+        self.memory = deque(maxlen=10000)
         self.gamma = 0.95
         self.epsilon = 1.0
-        self.epsilon_min = 0.1
-        self.epsilon_decay = 0.9992
-        self.lr = 0.0001 # 較低的學習率
-
+        self.epsilon_min = 0.02
+        self.epsilon_decay = 0.997
+        
+        
+        # 1. 先建立模型實體
         self.model = QNet(state_dim, action_dim).to(device)
         self.target_model = QNet(state_dim, action_dim).to(device)
         
+        # 2. 檢查檔案是否存在，存在才載入權重
         if os.path.exists(MODEL_PATH):
             try:
-                self.model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-                print(f"成功載入預訓練權重！")
-            except:
-                print("模型結構變更，從新開始訓練。")
-        
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+                state_dict = torch.load(MODEL_PATH, map_location=device)
+                self.model.load_state_dict(state_dict)
+                print(f"成功從 {MODEL_PATH} 載入預訓練權重！")
+            except Exception as e:
+                print(f"載入權重時發生錯誤（可能是模型結構不符）: {e}")
+        else:
+            print("找不到模型檔案，將使用隨機初始化的模型進行測試。")
+        # ------------------
+
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
         self.update_target()
 
     def update_target(self):
@@ -155,18 +148,19 @@ class DQNAgent:
 def run_simulation():
     # 測試與績效分析
     ticker = "SNPS"
-    data = get_cleaned_data(ticker, "2023-01-01",date.today().strftime('%Y-%m-%d'))
+    data = get_cleaned_data(ticker, "2022-01-01",date.today().strftime('%Y-%m-%d'))
     env = StockTradingEnv(data)
     agent = DQNAgent(env.state_dim, 3)
     state, _ = env.reset()
     history = []
-    
-    while True:
+    for n in range(len(data)-32):
         action = agent.act(state, train=False)
         state, _, done, _, _ = env.step(action)
+        print(f"Step: {n+1} | Action: {['Hold', 'Buy', 'Sell'][action]} | Net Worth: {env.net_worth:.2f}") # 每一步都印出動作與淨資產
         history.append(env.net_worth)
         if done: break
 
+    # 計算績效指標
     history = np.array(history)
     returns = np.diff(history) / history[:-1]
     sharpe = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
@@ -178,12 +172,14 @@ def run_simulation():
     print(f"最大回撤: {max_dd:.2f}%")
 
     plt.figure(figsize=(12, 6))
-    plt.plot(history, label='Double DQN Strategy', color='forestgreen')
-    plt.title(f"AI Trading: {ticker} (2024-Present)")
-    plt.ylabel("Net Worth (USD)")
+    plt.plot(history, label='AI Strategy', color='royalblue')
+    plt.title(f"AI Trading Performance: {ticker}")
+    plt.ylabel("Net Worth (TWD)")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.savefig("final_performance.png")
+    #plt.show()
+    print("績效圖已儲存為 final_performance.png")
     plt.close()
 
 if __name__ == "__main__":
