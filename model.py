@@ -161,13 +161,13 @@ class DQNAgent:
 
 # --- 4. 執行與分析報告 ---
 def run_simulation():
-    ticker = "SNPS"
-    data = get_cleaned_data(ticker, "2020-01-01", "2022-01-01")
+    ticker = "GOOG"
+    data = get_cleaned_data(ticker, "2010-01-01", "2022-04-26")
     env = StockTradingEnv(data)
     agent = DQNAgent(env.state_dim, 3)
 
     # 訓練階段
-    EPISODES = 50
+    EPISODES = 10
     print(f"開始優化 {ticker} 的交易策略...")
     for e in range(EPISODES):
         state, _ = env.reset()
@@ -176,7 +176,7 @@ def run_simulation():
             next_state, reward, done, _, _ = env.step(action)
             agent.memory.append((state, action, reward, next_state, done))
             state = next_state
-            if t % 10 == 0: agent.train(64) # 每 n 步訓練一次
+            if t % 10 == 0: agent.train(16) # 每 n 步訓練一次
             if done: break
         agent.update_target()
         print(f"Episode {e+1}/{EPISODES} | Net Worth: {env.net_worth:.2f} | Eps: {agent.epsilon:.2f}")
@@ -186,7 +186,7 @@ def run_simulation():
     print(f"模型已成功儲存於 {MODEL_PATH}")
 
     # 測試與績效分析
-    data = get_cleaned_data(ticker, "2024-01-01",date.today().strftime('%Y-%m-%d'))
+    data = get_cleaned_data(ticker, "2022-01-01",date.today().strftime('%Y-%m-%d'))
     env = StockTradingEnv(data)
     state, _ = env.reset()
     history = []

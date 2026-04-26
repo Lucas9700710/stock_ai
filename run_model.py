@@ -143,8 +143,8 @@ class DQNAgent:
 # --- 4. 執行與分析報告 ---
 def run_simulation():
     # 測試與績效分析
-    ticker = "SNPS"
-    data = get_cleaned_data(ticker, "2024-01-01",date.today().strftime('%Y-%m-%d'))
+    ticker = "GOOG"
+    data = get_cleaned_data(ticker, "2022-01-01",date.today().strftime('%Y-%m-%d'))
     env = StockTradingEnv(data)
     agent = DQNAgent(env.state_dim, 3)
     state, _ = env.reset()
